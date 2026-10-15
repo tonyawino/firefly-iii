@@ -595,6 +595,25 @@ final class ProvisioningServiceTest extends TestCase
         self::assertNull(ProvisioningState::query()->findOrFail(1)->tenant_id);
     }
 
+    public function testRotationWaitsForBootstrapAcknowledgementAndPreservesReplay(): void
+    {
+        $this->createBootstrapSchema();
+        $bootstrapKey = (string) Str::uuid();
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey);
+        $rotationKey = (string) Str::uuid();
+        try {
+            $this->service()->rotate(self::TENANT_ID, $rotationKey);
+            self::fail('A pending bootstrap must remain replayable until acknowledgement.');
+        } catch (DomainException $exception) {
+            self::assertSame('rotation_conflict', $exception->getMessage());
+        }
+        self::assertSame($bootstrap, $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+        self::assertSame(1, Passport::token()->newQuery()->count());
+        self::assertSame(1, ProvisioningOperation::query()->count());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
+        self::assertSame('prepared', $this->service()->rotate(self::TENANT_ID, $rotationKey)['state']);
+    }
+
     public function testRotationReplaysThenConfirmsOnlyThePriorTokenAndAllowsAnotherRotation(): void
     {
         $this->createBootstrapSchema();
@@ -635,7 +654,8 @@ final class ProvisioningServiceTest extends TestCase
     public function testDistinctRotationKeyConflictsWhilePrepared(): void
     {
         $this->createBootstrapSchema();
-        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
         $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
         $this->expectException(DomainException::class);
         $this->expectExceptionMessage('rotation_conflict');
@@ -652,6 +672,7 @@ final class ProvisioningServiceTest extends TestCase
     {
         $this->createBootstrapSchema();
         $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
         $oldId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
         $key = (string) Str::uuid();
         $result = $this->service()->rotate(self::TENANT_ID, $key);
@@ -695,7 +716,8 @@ final class ProvisioningServiceTest extends TestCase
     public function testRotationPrepareAndConfirmFailuresRollBackAllChanges(): void
     {
         $this->createBootstrapSchema();
-        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
         $oldId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
         ProvisioningOperation::creating(static function (): never { throw new RuntimeException('synthetic_write_failure'); });
         try {
@@ -725,7 +747,8 @@ final class ProvisioningServiceTest extends TestCase
     public function testRotationSuppressesNotificationsAndRestoresListenersEvenOnPassportFailure(): void
     {
         $this->createBootstrapSchema();
-        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
         Notification::fake();
         Mail::fake();
         $calls = 0;

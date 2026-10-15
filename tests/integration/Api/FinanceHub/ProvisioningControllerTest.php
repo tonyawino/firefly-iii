@@ -299,7 +299,9 @@ final class ProvisioningControllerTest extends TestCase
         DB::table('transaction_currencies')->insert(['code' => 'EUR', 'name' => 'Euro', 'symbol' => '€']);
         $handler = new TestHandler();
         Log::swap(new Logger('rotation-test', [$handler]));
-        $old = $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk()->json('credential');
+        $bootstrap = $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk();
+        $old = $bootstrap->json('credential');
+        $this->postJson(self::PREFIX.'/operations/'.$bootstrap->json('operation_id').'/ack', ['tenant_id' => self::TENANT], $this->headers())->assertOk();
         $payload = $this->payload();
         $prepared = $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertOk();
         $new = $prepared->json('credential');
@@ -335,7 +337,8 @@ final class ProvisioningControllerTest extends TestCase
 
     public function testRotationDecryptionAndForeignOperationsReturnSanitizedErrors(): void
     {
-        $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk();
+        $bootstrap = $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk();
+        $this->postJson(self::PREFIX.'/operations/'.$bootstrap->json('operation_id').'/ack', ['tenant_id' => self::TENANT], $this->headers())->assertOk();
         $payload = $this->payload();
         $result = $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertOk();
         $operationId = $result->json('operation_id');

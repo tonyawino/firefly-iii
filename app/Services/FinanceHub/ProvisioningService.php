@@ -183,6 +183,10 @@ final class ProvisioningService
 
         return $this->withLockedState($tenantId, function (ProvisioningState $state) use ($idempotencyKey): array {
             $this->activeCredentialChain($state);
+            // Bootstrap replay must remain usable until Hub has acknowledged it.
+            if ('acknowledged' !== $this->bootstrapOperation($state, (string) $state->bootstrap_operation_id)->state) {
+                throw new DomainException('rotation_conflict');
+            }
             $operation = ProvisioningOperation::query()->where('kind', 'rotate')->where('idempotency_key', $idempotencyKey)->first();
             if (null !== $operation) {
                 return $this->rotationResult($this->rotationOperation($state, $operation->id));
