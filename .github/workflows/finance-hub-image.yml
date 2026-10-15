@@ -1,0 +1,153 @@
+name: Finance Hub derivative image
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - Dockerfile
+      - 'app/**/FinanceHub/**'
+      - app/Http/Middleware/AuthenticateFinanceHubProvisioner.php
+      - bootstrap/app.php
+      - config/finance-hub.php
+      - routes/api.php
+      - database/migrations/2026_10_15_000000_create_finance_hub_provisioning_tables.php
+      - 'tests/**'
+      - 'scripts/*finance-hub*'
+      - 'scripts/verify-derivative-image*'
+      - docker/compose.finance-hub-bootstrap-test.yaml
+      - .github/workflows/finance-hub-image.yml
+      - 'docs/*provisioning*'
+      - docs/tenant-image-release.md
+  push:
+    tags: ['6.7.9-fh.*']
+  workflow_dispatch:
+    inputs:
+      synthetic_integration:
+        description: Run the disposable synthetic Compose proof
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: finance-hub-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: bcmath, curl, intl, mbstring, pdo_sqlite, xml
+          coverage: none
+          tools: composer:v2
+      - name: Install locked dependencies without production install hooks
+        run: composer install --no-interaction --prefer-dist --no-progress --no-scripts
+      - name: Focused private provisioning tests
+        run: |
+          php vendor/bin/phpunit -c phpunit.xml --no-coverage \
+            tests/unit/Http/Middleware/AuthenticateFinanceHubProvisionerTest.php \
+            tests/integration/Services/FinanceHub/ProvisioningServiceTest.php \
+            tests/integration/Api/FinanceHub/ProvisioningControllerTest.php
+      - name: Lint the exact PHP overlay
+        run: |
+          node --input-type=module -e 'import {OVERLAY_FILES} from "./scripts/verify-derivative-image.mjs"; console.log(OVERLAY_FILES.join("\n"))' |
+            while IFS= read -r file; do php -l "$file"; done
+      - name: Offline verifier tests
+        run: node --test scripts/verify-derivative-image.test.mjs
+      - uses: docker/setup-buildx-action@v3
+      - name: Build locally without pushing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: fireflyiii-tenant-bootstrap:local
+          build-args: DERIVATIVE_COMMIT=${{ github.sha }}
+      - name: Verify local derivative and inherited startup
+        run: |
+          docker pull fireflyiii/core@sha256:a2b53539338d1cd04d341b229c3806cb178cf64c72459060e3ed34bec4167bd8
+          node scripts/verify-derivative-image.mjs --local fireflyiii-tenant-bootstrap:local
+      - name: Opt-in synthetic Compose integration
+        if: >-
+          inputs.synthetic_integration == true ||
+          contains(github.event.pull_request.labels.*.name, 'finance-hub-integration')
+        run: bash scripts/test-finance-hub-bootstrap.sh
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/6.7.9-fh.')
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: finance-hub-image-publication
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      IMAGE: ghcr.io/tonyawino/firefly-iii
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify source ancestry, pinned Dockerfile and release/tag absence
+        run: node scripts/verify-derivative-image.mjs --preflight "$RELEASE_TAG"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Create exact corresponding source archive
+        run: |
+          mkdir -p dist
+          git archive --format=tar --prefix="firefly-iii-$RELEASE_TAG/" HEAD > "dist/firefly-iii-$RELEASE_TAG.tar"
+          (cd dist && sha256sum "firefly-iii-$RELEASE_TAG.tar" > SHA256SUMS)
+      # Content-addressed upload only: no staging tag, release tag or GitHub release.
+      - name: Build both platforms with provenance and SBOM by digest only
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          outputs: type=image,name=ghcr.io/tonyawino/firefly-iii,push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          build-args: DERIVATIVE_COMMIT=${{ github.sha }}
+      - name: Independently verify registry index, platform layers and exact source
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          node scripts/verify-derivative-image.mjs --release "$RELEASE_TAG" \
+            "dist/firefly-iii-$RELEASE_TAG.tar" "$IMAGE_DIGEST" dist
+          (cd dist && sha256sum release-manifest.json release-evidence.json >> SHA256SUMS)
+      - name: Recheck absence and publish the single immutable version tag
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          node scripts/verify-derivative-image.mjs --preflight "$RELEASE_TAG"
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$RELEASE_TAG" "$IMAGE@$IMAGE_DIGEST"
+          observed=$(docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" | awk '$1 == "Digest:" {print $2}')
+          test "$observed" = "$IMAGE_DIGEST"
+      - name: Publish source, checksum and provenance manifest without clobbering
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+            --notes "Finance Hub private Firefly derivative. Deploy the image index digest in release-manifest.json. Corresponding source, checksums, and offline verification evidence are attached; OCI provenance and SBOM are attached to the image index." \
+            "dist/firefly-iii-$RELEASE_TAG.tar" dist/SHA256SUMS dist/release-manifest.json dist/release-evidence.json
