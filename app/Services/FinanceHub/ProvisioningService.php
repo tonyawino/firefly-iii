@@ -12,11 +12,13 @@ use FireflyIII\User;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Laravel\Passport\ClientRepository;
 use Laravel\Passport\Events\AccessTokenCreated;
 use Laravel\Passport\Passport;
 use Laravel\Passport\PersonalAccessTokenResult;
+use Psr\Log\NullLogger;
 use RuntimeException;
 use SensitiveParameter;
 use Throwable;
@@ -34,14 +36,7 @@ final class ProvisioningService
      */
     public function withLockedState(string $tenantId, callable $callback): mixed
     {
-        $configuredTenant = config('finance-hub.tenant_id');
-        if (!is_string($configuredTenant)
-            || 1 !== preg_match('/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i', $configuredTenant)) {
-            throw new RuntimeException('provisioning_unavailable');
-        }
-        if ($tenantId !== $configuredTenant) {
-            throw new DomainException('tenant_mismatch');
-        }
+        $this->assertTenant($tenantId);
 
         return DB::transaction(static function () use ($tenantId, $callback): mixed {
             $state = ProvisioningState::query()->whereKey(1)->lockForUpdate()->first();
@@ -55,6 +50,19 @@ final class ProvisioningService
 
             return $callback($state);
         });
+    }
+
+    /** Validate instance identity before acquiring any database connection. */
+    public function assertTenant(string $tenantId): void
+    {
+        $configuredTenant = config('finance-hub.tenant_id');
+        if (!is_string($configuredTenant)
+            || 1 !== preg_match('/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i', $configuredTenant)) {
+            throw new RuntimeException('provisioning_unavailable');
+        }
+        if ($tenantId !== $configuredTenant) {
+            throw new DomainException('tenant_mismatch');
+        }
     }
 
     /** @return array{operation_id: string, state: string, credential?: string} */
@@ -91,10 +99,7 @@ final class ProvisioningService
                 throw new DomainException('bootstrap_conflict');
             }
 
-            $owner = app(UserRepositoryInterface::class)->store([
-                'email' => 'finance-hub-'.Str::uuid().'@invalid',
-                'role' => 'owner',
-            ]);
+            $owner = $this->createIntegrationOwner();
             $owner->forceFill([
                 'password' => Hash::make(bin2hex(random_bytes(32))),
                 'remember_token' => bin2hex(random_bytes(32)),
@@ -155,6 +160,23 @@ final class ProvisioningService
 
             return ['operation_id' => $operation->id, 'state' => $operation->state];
         });
+    }
+
+    private function createIntegrationOwner(): User
+    {
+        // attachRole() catches database exceptions and logs their raw SQL itself.
+        // Silence only this repository call; the controller returns a fixed error
+        // and the missing owner role makes the surrounding transaction roll back.
+        $logger = Log::getFacadeRoot();
+        Log::swap(new NullLogger());
+        try {
+            return app(UserRepositoryInterface::class)->store([
+                'email' => 'finance-hub-'.Str::uuid().'@invalid',
+                'role' => 'owner',
+            ]);
+        } finally {
+            Log::swap($logger);
+        }
     }
 
     private function createIntegrationToken(User $owner): PersonalAccessTokenResult

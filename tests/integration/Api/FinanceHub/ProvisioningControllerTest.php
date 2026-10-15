@@ -148,7 +148,13 @@ final class ProvisioningControllerTest extends TestCase
 
     public function testProvisioningRoutesExcludeUserAuthSessionAndCors(): void
     {
-        foreach ([['POST', '/bootstrap'], ['GET', '/operations/'.Str::uuid()], ['POST', '/operations/'.Str::uuid().'/ack']] as [$method, $path]) {
+        foreach ([
+            ['POST', '/bootstrap'],
+            ['GET', '/operations/'.Str::uuid()],
+            ['POST', '/operations/'.Str::uuid().'/ack'],
+            ['POST', '/credentials/rotate'],
+            ['POST', '/credentials/rotate/'.Str::uuid().'/confirm'],
+        ] as [$method, $path]) {
             $route = app('router')->getRoutes()->match(Request::create(self::PREFIX.$path, $method));
             self::assertSame([AuthenticateFinanceHubProvisioner::class], app('router')->gatherRouteMiddleware($route));
         }
@@ -204,6 +210,68 @@ final class ProvisioningControllerTest extends TestCase
         self::assertStringNotContainsString($credential, $logs);
         self::assertStringNotContainsString(self::SECRET, $logs);
         self::assertStringNotContainsString('Authorization', $logs);
+    }
+
+    #[DataProvider('rotationEndpoints')]
+    public function testRotationPlaceholdersAreAuthenticatedValidatedAndHaveNoDatabaseEffects(string $path, array $payload): void
+    {
+        DB::connection()->enableQueryLog();
+        $response = $this->postJson(self::PREFIX.$path, $payload, $this->headers());
+        $response->assertStatus(503)->assertExactJson(['error' => 'rotation_unavailable']);
+        self::assertStringContainsString('no-store', $response->headers->get('Cache-Control'));
+        $this->postJson(self::PREFIX.$path, $payload)->assertUnauthorized();
+        $this->postJson(self::PREFIX.$path, $payload + ['email' => 'injected@invalid'], $this->headers())->assertStatus(422)->assertExactJson(['error' => 'invalid_request']);
+        $this->postJson(self::PREFIX.$path, array_replace($payload, ['tenant_id' => '550e8400-e29b-41d4-a716-446655440001']), $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'tenant_mismatch']);
+        $this->postJson(self::PREFIX.$path, array_replace($payload, ['tenant_id' => []]), $this->headers())->assertStatus(422);
+        $this->postJson(self::PREFIX.$path.'/extra', $payload, $this->headers())->assertNotFound();
+        config()->set('finance-hub.provisioning_secret', null);
+        $this->postJson(self::PREFIX.$path, $payload, $this->headers())->assertNotFound();
+        self::assertSame([], DB::connection()->getQueryLog());
+        DB::connection()->disableQueryLog();
+    }
+
+    public static function rotationEndpoints(): iterable
+    {
+        yield 'prepare' => ['/credentials/rotate', ['tenant_id' => self::TENANT, 'idempotency_key' => self::TENANT]];
+        yield 'confirm' => ['/credentials/rotate/'.self::TENANT.'/confirm', ['tenant_id' => self::TENANT]];
+    }
+
+    public function testRotationPlaceholderIdentifiersAreStrictUuids(): void
+    {
+        $this->postJson(self::PREFIX.'/credentials/rotate', ['tenant_id' => self::TENANT, 'idempotency_key' => 'bad-key'], $this->headers())->assertStatus(422);
+        $this->postJson(self::PREFIX.'/credentials/rotate/not-a-uuid/confirm', ['tenant_id' => self::TENANT], $this->headers())->assertStatus(422);
+    }
+
+    #[DataProvider('failingRepositoryTables')]
+    public function testActualRepositoryDatabaseErrorsNeverLeakSqlOrSecretsAndRestoreLogging(string $table): void
+    {
+        // The role pivot failure is caught and logged internally by UserRepository.
+        // A users failure escapes store(), exercising its logger restoration finally.
+        DB::unprepared('CREATE TRIGGER synthetic_repository_failure BEFORE INSERT ON '.$table.
+            " BEGIN SELECT RAISE(ABORT, 'synthetic-sensitive-credential ".self::SECRET."'); END");
+        $handler = new TestHandler();
+        $logger = new Logger('provisioning-sql-test', [$handler]);
+        Log::swap($logger);
+        $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())
+            ->assertStatus(500)->assertExactJson(['error' => 'provisioning_failed']);
+        self::assertSame($logger, Log::getFacadeRoot());
+        $logs = strtolower(json_encode($handler->getRecords()));
+        foreach (['sqlstate', 'insert into', 'role_user', 'synthetic-sensitive-credential', self::SECRET, 'authorization'] as $sensitive) {
+            self::assertStringNotContainsString(strtolower($sensitive), $logs);
+        }
+        Log::warning('synthetic-restored-logger');
+        self::assertTrue($handler->hasWarning('synthetic-restored-logger'));
+        self::assertSame(0, User::query()->count());
+        self::assertSame(0, Passport::token()->newQuery()->count());
+        self::assertSame(0, ProvisioningOperation::query()->count());
+        self::assertNull(ProvisioningState::query()->findOrFail(1)->tenant_id);
+    }
+
+    public static function failingRepositoryTables(): iterable
+    {
+        yield 'role pivot' => ['role_user'];
+        yield 'user creation' => ['users'];
     }
 
     private function payload(): array

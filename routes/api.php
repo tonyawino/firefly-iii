@@ -51,6 +51,8 @@ Route::prefix('v1/finance-hub/provisioning')
         Route::post('bootstrap', [ProvisioningController::class, 'bootstrap']);
         Route::get('operations/{operationId}', [ProvisioningController::class, 'status']);
         Route::post('operations/{operationId}/ack', [ProvisioningController::class, 'acknowledge']);
+        Route::post('credentials/rotate', [ProvisioningController::class, 'rotate']);
+        Route::post('credentials/rotate/{operationId}/confirm', [ProvisioningController::class, 'confirmRotation']);
     });
 
 // API route for cron
