@@ -12,8 +12,11 @@ return new class extends Migration {
     {
         // An inline CHECK works on SQLite as well as PostgreSQL and MySQL;
         // SQLite cannot add a CHECK constraint with ALTER TABLE afterwards.
-        $table = DB::connection()->getQueryGrammar()->wrapTable('finance_hub_provisioning_state');
-        DB::statement('CREATE TABLE '.$table.' (id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1))');
+        $connection = DB::connection();
+        $table = $connection->getQueryGrammar()->wrapTable('finance_hub_provisioning_state');
+        // Raw DDL bypasses Laravel's configured engine; require row locks and rollback.
+        $engine = in_array($connection->getDriverName(), ['mysql', 'mariadb'], true) ? ' ENGINE=InnoDB' : '';
+        DB::statement('CREATE TABLE '.$table.' (id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1))'.$engine);
         Schema::table('finance_hub_provisioning_state', static function (Blueprint $table): void {
             $table->uuid('tenant_id')->nullable();
             $table->unsignedBigInteger('user_id')->nullable();

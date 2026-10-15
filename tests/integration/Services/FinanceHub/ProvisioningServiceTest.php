@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Override;
+use PDO;
 use PHPUnit\Framework\Attributes\CoversNothing;
 use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
@@ -55,6 +56,56 @@ final class ProvisioningServiceTest extends TestCase
         self::assertNull($state->user_id);
         self::assertNull($state->active_pat_id);
         self::assertNull($state->bootstrap_operation_id);
+    }
+
+    #[DataProvider('migrationDrivers')]
+    public function testSingletonUsesTransactionalEngineOnMysqlFamilyOnly(string $driver, bool $requiresEngine): void
+    {
+        $originalConnection = DB::getDefaultConnection();
+        $originalSchema = Schema::getFacadeRoot();
+        config()->set('database.connections.provisioning_sql_test', [
+            'driver' => $driver,
+            'database' => ':memory:',
+            'prefix' => '',
+            'engine' => 'InnoDB',
+        ]);
+        DB::setDefaultConnection('provisioning_sql_test');
+        if ('mariadb' === $driver) {
+            // MariaDB's UUID grammar reads version metadata even in pretend mode.
+            DB::connection()->setPdo(new class extends PDO {
+                public function __construct() {}
+
+                public function getAttribute(int $attribute): mixed
+                {
+                    return '11.4.0-MariaDB';
+                }
+            });
+        }
+        Schema::swap(DB::connection()->getSchemaBuilder());
+        try {
+            $migration = require base_path('database/migrations/2026_10_15_000000_create_finance_hub_provisioning_tables.php');
+            $queries = DB::pretend(static fn () => $migration->up());
+        } finally {
+            DB::setDefaultConnection($originalConnection);
+            Schema::swap($originalSchema);
+            DB::purge('provisioning_sql_test');
+        }
+        $create = $queries[0]['query'];
+        self::assertStringStartsWith('CREATE TABLE ', $create);
+        self::assertStringContainsString('finance_hub_provisioning_state', $create);
+        if ($requiresEngine) {
+            self::assertStringEndsWith(' ENGINE=InnoDB', $create);
+        } else {
+            self::assertStringNotContainsString('ENGINE=', $create);
+        }
+    }
+
+    public static function migrationDrivers(): iterable
+    {
+        yield 'MySQL' => ['mysql', true];
+        yield 'MariaDB' => ['mariadb', true];
+        yield 'PostgreSQL' => ['pgsql', false];
+        yield 'SQLite' => ['sqlite', false];
     }
 
     public function testDuplicateSingletonIsRejectedByTheDatabase(): void
