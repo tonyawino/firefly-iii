@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace FireflyIII\Services\FinanceHub;
 
 use DomainException;
+use FireflyIII\Console\Commands\Correction\CreatesGroupMemberships;
+use FireflyIII\Enums\UserRoleEnum;
 use FireflyIII\Models\FinanceHub\ProvisioningOperation;
 use FireflyIII\Models\FinanceHub\ProvisioningState;
 use FireflyIII\Repositories\User\UserRepositoryInterface;
@@ -82,6 +84,9 @@ final class ProvisioningService
                 $owner = User::query()->find($state->user_id);
                 $token = Passport::token()->newQuery()->find($operation->pat_id);
                 if (null === $owner || $owner->blocked || !$owner->hasRole('owner')
+                    || null === $owner->userGroup
+                    || !$owner->groupMemberships()->where('user_group_id', $owner->user_group_id)
+                        ->whereHas('userRole', static fn ($query) => $query->where('title', UserRoleEnum::OWNER->value))->exists()
                     || 1 !== User::query()->count()
                     || null === $token || $token->revoked || $token->expires_at?->isPast()
                     || null === $token->client || $token->client->revoked || !$token->client->hasGrantType('personal_access')
@@ -107,6 +112,9 @@ final class ProvisioningService
             if ($owner->blocked || !$owner->hasRole('owner')) {
                 throw new RuntimeException('provisioning_failed');
             }
+            // Match Firefly's administration setup without registration events
+            // (those events also send signup and administrator notifications).
+            CreatesGroupMemberships::createGroupMembership($owner);
 
             // Use the same Passport grant-client facility as Firefly's OAuth UI.
             $provider = config('auth.guards.api.provider');

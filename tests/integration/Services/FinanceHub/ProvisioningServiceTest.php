@@ -5,8 +5,13 @@ declare(strict_types=1);
 namespace Tests\integration\Services\FinanceHub;
 
 use DomainException;
+use FireflyIII\Enums\UserRoleEnum;
+use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Models\FinanceHub\ProvisioningOperation;
 use FireflyIII\Models\FinanceHub\ProvisioningState;
+use FireflyIII\Models\GroupMembership;
+use FireflyIII\Models\UserGroup;
+use FireflyIII\Models\UserRole;
 use FireflyIII\Services\FinanceHub\ProvisioningService;
 use FireflyIII\User;
 use Illuminate\Database\QueryException;
@@ -342,6 +347,14 @@ final class ProvisioningServiceTest extends TestCase
         $owner = User::query()->sole();
         self::assertFalse($owner->blocked);
         self::assertTrue($owner->hasRole('owner'));
+        self::assertSame(1, UserGroup::query()->count());
+        self::assertSame(1, GroupMembership::query()->count());
+        self::assertGreaterThan(0, $owner->getAdministrationId());
+        self::assertSame($owner->getAdministrationId(), UserGroup::query()->sole()->id);
+        $membership = GroupMembership::query()->sole();
+        self::assertSame($owner->id, $membership->user_id);
+        self::assertSame($owner->getAdministrationId(), $membership->user_group_id);
+        self::assertSame(UserRoleEnum::OWNER->value, $membership->userRole->title);
         self::assertStringEndsWith('@invalid', $owner->email);
         self::assertSame('bcrypt', Hash::info($owner->password)['algoName']);
         self::assertGreaterThanOrEqual(40, strlen($owner->remember_token));
@@ -371,6 +384,8 @@ final class ProvisioningServiceTest extends TestCase
         self::assertSame(1, Passport::token()->newQuery()->count());
         self::assertSame(1, ProvisioningOperation::query()->count());
         self::assertSame(1, Passport::client()->newQuery()->count());
+        self::assertSame(1, UserGroup::query()->count());
+        self::assertSame(1, GroupMembership::query()->count());
     }
 
     public function testAnotherBootstrapKeyConflictsWithoutCreatingUserOrToken(): void
@@ -438,6 +453,8 @@ final class ProvisioningServiceTest extends TestCase
             ProvisioningOperation::flushEventListeners();
         }
         self::assertSame(0, User::query()->count());
+        self::assertSame(0, UserGroup::query()->count());
+        self::assertSame(0, GroupMembership::query()->count());
         self::assertSame(0, Passport::token()->newQuery()->count());
         self::assertSame(0, Passport::client()->newQuery()->count());
         self::assertSame(0, ProvisioningOperation::query()->count());
@@ -500,6 +517,8 @@ final class ProvisioningServiceTest extends TestCase
         }
         self::assertSame($listeners, app('events')->getRawListeners()[AccessTokenCreated::class] ?? []);
         self::assertSame(0, User::query()->count());
+        self::assertSame(0, UserGroup::query()->count());
+        self::assertSame(0, GroupMembership::query()->count());
         self::assertSame(0, Passport::token()->newQuery()->count());
         self::assertSame(0, Passport::client()->newQuery()->count());
     }
@@ -512,6 +531,8 @@ final class ProvisioningServiceTest extends TestCase
         $this->service()->bootstrap(self::TENANT_ID, $key);
         match ($mutation) {
             'missing user' => User::query()->delete(),
+            'missing group' => UserGroup::query()->delete(),
+            'missing membership' => GroupMembership::query()->delete(),
             'blocked user' => User::query()->update(['blocked' => true]),
             'missing role' => DB::table('role_user')->delete(),
             'missing token' => Passport::token()->newQuery()->delete(),
@@ -535,7 +556,7 @@ final class ProvisioningServiceTest extends TestCase
 
     public static function inconsistentBootstrapRecords(): iterable
     {
-        foreach (['missing user', 'blocked user', 'missing role', 'missing token', 'revoked token', 'revoked client', 'foreign token', 'untracked user'] as $mutation) {
+        foreach (['missing user', 'missing group', 'missing membership', 'blocked user', 'missing role', 'missing token', 'revoked token', 'revoked client', 'foreign token', 'untracked user'] as $mutation) {
             yield $mutation => [$mutation];
         }
     }
@@ -553,6 +574,24 @@ final class ProvisioningServiceTest extends TestCase
         }
         self::assertSame('prepared', ProvisioningOperation::query()->sole()->state);
         self::assertNotNull(ProvisioningOperation::query()->sole()->encrypted_credential);
+    }
+
+    public function testMissingGroupOwnerRoleRollsBackTheEntireBootstrap(): void
+    {
+        $this->createBootstrapSchema();
+        UserRole::query()->delete();
+        try {
+            $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+            self::fail('A missing administration owner role must fail closed.');
+        } catch (FireflyException) {
+            // This is a deployment/schema failure, never a reason to create a PAT.
+        }
+        self::assertSame(0, User::query()->count());
+        self::assertSame(0, UserGroup::query()->count());
+        self::assertSame(0, GroupMembership::query()->count());
+        self::assertSame(0, Passport::token()->newQuery()->count());
+        self::assertSame(0, ProvisioningOperation::query()->count());
+        self::assertNull(ProvisioningState::query()->findOrFail(1)->tenant_id);
     }
 
     private function assertBootstrapConflict(string $key, string $code, int $tokens = 1): void

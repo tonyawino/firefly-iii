@@ -80,6 +80,23 @@ final class ProvisioningControllerTest extends TestCase
         $this->getJson('/api/v1/about', ['Authorization' => 'Bearer '.$credential])->assertOk()->assertJsonStructure(['data' => ['version', 'driver']]);
     }
 
+    public function testReturnedCredentialAuthenticatesGroupScopedFinanceApi(): void
+    {
+        DB::table('transaction_currencies')->insert(['code' => 'EUR', 'name' => 'Euro', 'symbol' => '€']);
+        $credential = $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk()->json('credential');
+        $owner = User::query()->sole();
+        self::assertGreaterThan(0, (int) $owner->user_group_id);
+        $administrationId = $owner->getAdministrationId();
+        $headers = ['Authorization' => 'Bearer '.$credential];
+        $this->getJson('/api/v1/user-groups/'.$administrationId, $headers)->assertOk()
+            ->assertJsonPath('data.id', (string) $administrationId)
+            ->assertJsonPath('data.attributes.title', $owner->email);
+        // This controller validates the selected administration's membership and
+        // read role before accessing the real currency repository.
+        $this->getJson('/api/v1/autocomplete/currencies?query=EUR&user_group_id='.$administrationId, $headers)->assertOk()
+            ->assertJsonPath('0.code', 'EUR');
+    }
+
     #[DataProvider('unauthorizedRequests')]
     public function testAuthenticationRejectsBeforeDatabaseWork(?string $configured, ?string $authorization, int $status): void
     {
