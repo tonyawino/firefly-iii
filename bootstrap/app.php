@@ -47,6 +47,7 @@ use Illuminate\Foundation\Http\Middleware\PreventRequestsDuringMaintenance;
 use Illuminate\Foundation\Http\Middleware\TrimStrings;
 use Illuminate\Http\Middleware\HandleCors;
 use Illuminate\Http\Middleware\ValidatePostSize;
+use Illuminate\Http\Request;
 use Illuminate\View\Middleware\ShareErrorsFromSession;
 use Laravel\Passport\Http\Middleware\CreateFreshApiToken;
 use PragmaRX\Google2FALaravel\Middleware as MFAMiddleware;
@@ -73,6 +74,12 @@ $app = Application::configure(basePath: dirname(__DIR__))
                       health  : '/up',
                   )
                   ->withMiddleware(function (Middleware $middleware): void {
+                      // Private provisioning has no browser CORS surface, including preflight.
+                      HandleCors::skipWhen(static fn (Request $request): bool => $request->is(
+                          'api/v1/finance-hub/provisioning',
+                          'api/v1/finance-hub/provisioning/*'
+                      ));
+
 
                       // overrule the standard middleware
                       $middleware->use(

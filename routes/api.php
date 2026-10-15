@@ -24,6 +24,8 @@ declare(strict_types=1);
 
 use FireflyIII\Api\V1\Controllers\System\CronController;
 use FireflyIII\Api\V1\Controllers\System\ReleaseNotesController;
+use FireflyIII\Http\Controllers\FinanceHub\ProvisioningController;
+use FireflyIII\Http\Middleware\AuthenticateFinanceHubProvisioner;
 use Illuminate\Support\Facades\Route;
 
 use function Safe\define;
@@ -40,6 +42,16 @@ use function Safe\define;
 if (!defined('DATEFORMAT')) {
     define('DATEFORMAT', '(19|20)[0-9]{2}-?[0-9]{2}-?[0-9]{2}');
 }
+
+// Sessionless private provisioner; the dedicated instance secret is its only auth.
+Route::prefix('v1/finance-hub/provisioning')
+    ->withoutMiddleware(['api'])
+    ->middleware(AuthenticateFinanceHubProvisioner::class)
+    ->group(static function (): void {
+        Route::post('bootstrap', [ProvisioningController::class, 'bootstrap']);
+        Route::get('operations/{operationId}', [ProvisioningController::class, 'status']);
+        Route::post('operations/{operationId}/ack', [ProvisioningController::class, 'acknowledge']);
+    });
 
 // API route for cron
 Route::group(
