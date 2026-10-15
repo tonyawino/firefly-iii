@@ -63,8 +63,11 @@ The tag event's source tag necessarily exists: the verifier requires the exact
 `refs/tags/6.7.9-fh.N` lightweight ref to point to the derivative commit. It fails
 if the corresponding GitHub release or image tag already exists. GitHub lookup
 paginates every release, including drafts, and rejects duplicate tag records.
-Registry authorization, rate limits, malformed responses and non-404 manifest
-responses fail closed. Authentication uses only the job's scoped `GITHUB_TOKEN`,
+The registry lookup accepts OCI/Docker indexes and single-image manifests, so an
+existing single-platform tag cannot appear absent through content negotiation.
+Only JSON 404 errors with `MANIFEST_UNKNOWN` (missing tag) or `NAME_UNKNOWN`
+(missing repository) establish absence. Registry authorization, rate limits,
+malformed/HTML responses, other error codes and non-404 manifest responses fail closed. Authentication uses only the job's scoped `GITHUB_TOKEN`,
 with `contents:write` and `packages:write`; there are no PATs or account-specific
 repository secrets.
 
@@ -78,7 +81,9 @@ it cannot create a version tag or release.
 The verifier independently observes the registry index digest, inspects each
 platform from that index, compares actual base layer prefixes against the pinned
 official base, compares entrypoint/command/healthcheck, and inventories all files
-under `/var/www/html`. Only the exact overlay allowlist may differ. Overlay hashes
+under `/var/www/html`, including regular-file modes and symlink paths/targets.
+Unchanged upstream symlinks are retained; added, removed or retargeted links outside
+the exact overlay allowlist fail verification. Only that allowlist may differ. Overlay hashes
 must equal source hashes on both platforms. This verifies base ancestry beyond
 self-reported image labels. A manifest with a claimed index digest alone is
 insufficient. Unknown platforms and duplicate platform descriptors fail.

@@ -105,21 +105,30 @@ export async function checkReleaseAvailability(tag, commit, request) {
   assert.equal(ref.object?.sha, commit, 'source tag commit mismatch');
   const imageResponse = await request(`https://ghcr.io/v2/${REPOSITORY}/manifests/${tag}`);
   assert.equal(imageResponse.status, 404, 'image tag must be conclusively absent');
+  assert.match(imageResponse.headers.get('content-type') ?? '', /^application\/json(?:\s*;|$)/i, 'registry absence response must be JSON');
+  const missing = await imageResponse.json();
+  assert.ok(Array.isArray(missing?.errors) && missing.errors.length > 0
+    && missing.errors.every(error => error && ['MANIFEST_UNKNOWN', 'NAME_UNKNOWN'].includes(error.code)
+      && (error.message === undefined || typeof error.message === 'string')),
+  'registry absence response must contain only structured manifest/repository absence errors');
   return { existingReleaseTags, imageTagAbsent: true };
 }
 
-async function registryRequester() {
-  assert.ok(process.env.GH_TOKEN && process.env.GITHUB_ACTOR, 'workflow token and actor are required');
-  const tokenResponse = await fetch(`https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull`, {
-    headers: { Authorization: `Basic ${Buffer.from(`${process.env.GITHUB_ACTOR}:${process.env.GH_TOKEN}`).toString('base64')}` },
+export async function registryRequester({ token: githubToken = process.env.GH_TOKEN, actor = process.env.GITHUB_ACTOR, request = fetch } = {}) {
+  assert.ok(githubToken && actor, 'workflow token and actor are required');
+  const tokenResponse = await request(`https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull`, {
+    headers: { Authorization: `Basic ${Buffer.from(`${actor}:${githubToken}`).toString('base64')}` },
     signal: AbortSignal.timeout(30000), redirect: 'error',
   });
   assert.equal(tokenResponse.status, 200, 'registry authorization is indeterminate');
   const { token } = await tokenResponse.json();
   assert.ok(typeof token === 'string' && token.length > 0, 'missing registry lookup token');
-  return url => fetch(url, { headers: {
-    Authorization: `Bearer ${url.startsWith('https://api.github.com/') ? process.env.GH_TOKEN : token}`,
-    Accept: url.startsWith('https://api.github.com/') ? 'application/vnd.github+json' : 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json',
+  return url => request(url, { headers: {
+    Authorization: `Bearer ${url.startsWith('https://api.github.com/') ? githubToken : token}`,
+    Accept: url.startsWith('https://api.github.com/') ? 'application/vnd.github+json' : [
+      'application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
+      'application/vnd.docker.distribution.manifest.list.v2+json', 'application/vnd.docker.distribution.manifest.v2+json',
+    ].join(', '),
   }, signal: AbortSignal.timeout(30000), redirect: 'error' });
 }
 
@@ -150,10 +159,43 @@ function inspectImage(ref, platform, docker = 'docker') {
   return JSON.parse(run(docker, ['image', 'inspect', ref]))[0];
 }
 
+// Do not follow symlinks: their path and target are part of source provenance.
+// Parent directories may be added by COPY; files and links retain the exact allowlist.
+const INVENTORY_PHP = `
+$root = '/var/www/html';
+$entries = [];
+$iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
+foreach ($iterator as $entry) {
+    $path = substr($entry->getPathname(), strlen($root) + 1);
+    $metadata = lstat($entry->getPathname());
+    if (false === $metadata) { throw new RuntimeException('Cannot stat source entry'); }
+    $mode = $metadata['mode'] & 07777;
+    if ($entry->isLink()) {
+        $entries[$path] = ['type' => 'symlink', 'target' => $entry->getLinkTarget(), 'mode' => $mode];
+    } elseif ($entry->isFile()) {
+        $hash = hash_file('sha256', $entry->getPathname());
+        if (false === $hash) { throw new RuntimeException('Cannot hash source file'); }
+        $entries[$path] = ['type' => 'file', 'sha256' => $hash, 'mode' => $mode];
+    } else {
+        throw new RuntimeException('Unsupported source entry type');
+    }
+}
+echo json_encode((object) $entries, JSON_THROW_ON_ERROR);
+`;
+
 function inventory(ref, platform, docker = 'docker') {
-  const result = run(docker, ['run', '--rm', '--platform', platform, '--network', 'none', '--entrypoint', 'sh', ref, '-c',
-    'cd /var/www/html && find . -type f -exec sha256sum {} +']);
-  return new Map(result.split(/\r?\n/).map(line => [line.slice(68), line.slice(0, 64)]));
+  const args = ['run', '--rm'];
+  if (platform) args.push('--platform', platform);
+  args.push('--network', 'none', '--entrypoint', 'php', ref, '-r', INVENTORY_PHP);
+  return new Map(Object.entries(JSON.parse(run(docker, args))));
+}
+
+export function compareImageInventories(baseFiles, imageFiles) {
+  return {
+    overlayHashes: Object.fromEntries(OVERLAY_FILES.map(path => [path, imageFiles.get(path)?.sha256])),
+    changedImageFiles: [...new Set([...baseFiles.keys(), ...imageFiles.keys()])]
+      .filter(path => JSON.stringify(baseFiles.get(path)) !== JSON.stringify(imageFiles.get(path))),
+  };
 }
 
 function imageEvidence(base, derivative, baseFiles, imageFiles) {
@@ -163,8 +205,7 @@ function imageEvidence(base, derivative, baseFiles, imageFiles) {
   assert.ok(derivative.Config.Env.includes('FIREFLY_III_PATH=/var/www/html'), 'upstream application path changed');
   return {
     baseDigest: BASE_DIGEST, baseLayers: base.RootFS.Layers, imageLayers: derivative.RootFS.Layers,
-    overlayHashes: Object.fromEntries(OVERLAY_FILES.map(path => [path, imageFiles.get(path)])),
-    changedImageFiles: [...new Set([...baseFiles.keys(), ...imageFiles.keys()])].filter(path => baseFiles.get(path) !== imageFiles.get(path)),
+    ...compareImageInventories(baseFiles, imageFiles),
   };
 }
 
@@ -224,13 +265,8 @@ export function verifyLocalImage(image, docker = 'docker') {
   assert.equal(derivative.Config.Labels['org.opencontainers.image.revision'], sourceCommit, 'source commit label mismatch');
   assert.equal(derivative.Config.Labels['org.opencontainers.image.base.digest'], BASE_DIGEST, 'base digest label mismatch');
   assert.equal(derivative.Config.Labels['org.opencontainers.image.source'], 'https://github.com/tonyawino/firefly-iii', 'source repository label mismatch');
-  const inventory = ref => {
-    const result = run(['run', '--rm', '--network', 'none', '--entrypoint', 'sh', ref, '-c',
-      'cd /var/www/html && find . -type f -exec sha256sum {} +']);
-    return new Map(result.split(/\r?\n/).map(line => [line.slice(68), line.slice(0, 64)]));
-  };
-  const baseFiles = inventory(`fireflyiii/core@${BASE_DIGEST}`);
-  const imageFiles = inventory(image);
+  const baseFiles = inventory(`fireflyiii/core@${BASE_DIGEST}`, null, docker);
+  const imageFiles = inventory(image, null, docker);
   const overlays = Object.fromEntries(OVERLAY_FILES.map(path => [path, createHash('sha256').update(readFileSync(path)).digest('hex')]));
   const evidence = imageEvidence(base, derivative, baseFiles, imageFiles);
   verifyBaseLayers(evidence);

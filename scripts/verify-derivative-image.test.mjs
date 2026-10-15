@@ -135,7 +135,7 @@ test('GitHub lookup permits only the exact triggering lightweight tag and no rel
   const responses = [
     new Response('[]', { status: 200 }),
     Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } }),
-    new Response('', { status: 404 }),
+    Response.json({ errors: [{ code: 'MANIFEST_UNKNOWN', message: 'manifest unknown' }] }, { status: 404 }),
   ];
   assert.deepEqual(await checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift()), {
     existingReleaseTags: [], imageTagAbsent: true,
@@ -181,4 +181,75 @@ test('follows release pagination and detects duplicates across pages', async () 
   const firstPage = Array.from({ length: 100 }, (_, i) => ({ tag_name: `old-${i}` }));
   const pages = [Response.json(firstPage), Response.json([{ tag_name: 'old-0' }])];
   await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => pages.shift()), /duplicate release tag lookup/i);
+});
+
+
+test('registry lookup accepts existing OCI and Docker single image manifests', async () => {
+  const { checkReleaseAvailability, registryRequester } = await import('./verify-derivative-image.mjs');
+  for (const mediaType of ['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json']) {
+    const request = await registryRequester({ token: 'synthetic-token', actor: 'synthetic-actor', request: async (url, options) => {
+      if (url.startsWith('https://ghcr.io/token?')) return Response.json({ token: 'synthetic-registry-token' });
+      if (url.includes('/releases?')) return Response.json([]);
+      if (url.includes('/git/ref/')) return Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } });
+      // Reproduce GHCR content negotiation: an excluded single manifest looks missing.
+      return options.headers.Accept.split(', ').includes(mediaType)
+        ? Response.json({ schemaVersion: 2, mediaType })
+        : Response.json({ errors: [{ code: 'MANIFEST_UNKNOWN', message: 'manifest unknown' }] }, { status: 404 });
+    } });
+    await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, request), /image tag must be conclusively absent/i);
+  }
+});
+
+test('only structured manifest or repository absence proves an image tag is absent', async () => {
+  const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
+  for (const code of ['MANIFEST_UNKNOWN', 'NAME_UNKNOWN']) {
+    const responses = [Response.json([]), Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } }),
+      Response.json({ errors: [{ code, message: 'not found' }] }, { status: 404 })];
+    assert.equal((await checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift())).imageTagAbsent, true);
+  }
+});
+
+test('arbitrary, malformed and other registry 404 responses fail closed', async () => {
+  const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
+  for (const response of [
+    new Response('', { status: 404 }),
+    new Response('<html>Not found</html>', { status: 404, headers: { 'Content-Type': 'text/html' } }),
+    new Response('{', { status: 404, headers: { 'Content-Type': 'application/json' } }),
+    Response.json({ message: 'Not Found' }, { status: 404 }),
+    Response.json({ errors: [] }, { status: 404 }),
+    Response.json({ errors: [{ code: 'DENIED' }] }, { status: 404 }),
+    Response.json({ errors: [{ code: 'MANIFEST_UNKNOWN' }, { code: 'UNAUTHORIZED' }] }, { status: 404 }),
+    Response.json({ errors: [null] }, { status: 404 }),
+    Response.json({ errors: [{ code: 'MANIFEST_UNKNOWN', message: {} }] }, { status: 404 }),
+  ]) {
+    const responses = [Response.json([]), Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } }), response];
+    await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift()));
+  }
+});
+
+test('changed or added symlink entries cannot evade the exact overlay allowlist', async () => {
+  const { compareImageInventories } = await import('./verify-derivative-image.mjs');
+  for (const baseEntry of [undefined, { type: 'symlink', target: '../safe.php', mode: 511 }]) {
+    const { manifest, evidence } = fixture();
+    const baseFiles = new Map(Object.entries(manifest.overlays).map(([path, hash]) => [path, { type: 'file', sha256: hash, mode: 420 }]));
+    if (baseEntry) baseFiles.set('public/debug.php', baseEntry);
+    const imageFiles = new Map(baseFiles);
+    imageFiles.set('public/debug.php', { type: 'symlink', target: '../unsafe.php', mode: 511 });
+    Object.assign(evidence, compareImageInventories(baseFiles, imageFiles));
+    assert.throws(() => verifyDerivativeImage(manifest, evidence), /non-approved source file: public\/debug.php/i);
+  }
+});
+
+test('unchanged legitimate symlinks are accepted and regular file mode changes are inventoried', async () => {
+  const { compareImageInventories } = await import('./verify-derivative-image.mjs');
+  const { manifest, evidence } = fixture();
+  const baseFiles = new Map(Object.entries(manifest.overlays).map(([path, hash]) => [path, { type: 'file', sha256: hash, mode: 420 }]));
+  baseFiles.set('public/storage', { type: 'symlink', target: '../storage/app/public', mode: 511 });
+  baseFiles.set('public/index.php', { type: 'file', sha256: 'f'.repeat(64), mode: 420 });
+  const imageFiles = new Map(baseFiles);
+  Object.assign(evidence, compareImageInventories(baseFiles, imageFiles));
+  assert.equal(verifyDerivativeImage(manifest, evidence), true);
+  imageFiles.set('public/index.php', { ...imageFiles.get('public/index.php'), mode: 493 });
+  Object.assign(evidence, compareImageInventories(baseFiles, imageFiles));
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /non-approved source file: public\/index.php/i);
 });
