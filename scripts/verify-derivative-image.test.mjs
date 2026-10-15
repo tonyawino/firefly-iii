@@ -19,9 +19,18 @@ function fixture() {
     manifest: {
       release_tag: '6.7.9-fh.1', upstream_commit: 'ba26768619842a4926655f315716f1b7788933d7',
       base_digest: base, derivative_commit: commit, overlays,
-      image_digest: `sha256:${'c'.repeat(64)}`,
+      image_digest: `sha256:${'c'.repeat(64)}`, source_archive_sha256: 'e'.repeat(64),
     },
-    evidence: { sourceCommit: commit, overlayHashes: { ...overlays }, changedImageFiles: [...paths], existingReleaseTags: [] },
+    evidence: {
+      sourceCommit: commit, overlayHashes: { ...overlays }, changedImageFiles: [...paths], existingReleaseTags: [],
+      upstreamIsAncestor: true, sourceArchiveSha256: 'e'.repeat(64), imageIndexDigest: `sha256:${'c'.repeat(64)}`,
+      imageTagAbsent: true,
+      platforms: Object.fromEntries(['linux/amd64', 'linux/arm64'].map(platform => [platform, {
+        baseDigest: base, baseLayers: [`sha256:${'f'.repeat(64)}`],
+        imageLayers: [`sha256:${'f'.repeat(64)}`, `sha256:${'b'.repeat(64)}`],
+        overlayHashes: { ...overlays }, changedImageFiles: [...paths],
+      }])),
+    },
   };
 }
 test('accepts the approved base digest and exact derivative source commit', () => {
@@ -65,4 +74,111 @@ test('rejects a missing approved overlay even if the manifest and image agree', 
   delete manifest.overlays['routes/api.php'];
   delete evidence.overlayHashes['routes/api.php'];
   assert.throws(() => verifyDerivativeImage(manifest, evidence), /overlay.*files/i);
+});
+
+test('rejects malformed or unsupported release tags', () => {
+  for (const tag of ['local-proof', '6.7.9-fh.0', '6.7.9-fh.01', '6.7.8-fh.1', '6.7.9-fh.1\n', 'latest']) {
+    const { manifest, evidence } = fixture();
+    manifest.release_tag = tag;
+    assert.throws(() => verifyDerivativeImage(manifest, evidence), /release tag syntax/i);
+  }
+});
+test('requires independently observed image index digest', () => {
+  const { manifest, evidence } = fixture();
+  evidence.imageIndexDigest = `sha256:${'d'.repeat(64)}`;
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /image index digest/i);
+});
+test('requires selected upstream ancestry', () => {
+  const { manifest, evidence } = fixture();
+  evidence.upstreamIsAncestor = false;
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /upstream ancestry/i);
+});
+test('requires the exact source archive checksum', () => {
+  const { manifest, evidence } = fixture();
+  evidence.sourceArchiveSha256 = 'd'.repeat(64);
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /source archive checksum/i);
+});
+test('checks actual base layer ancestry for both release platforms', () => {
+  for (const platform of ['linux/amd64', 'linux/arm64']) {
+    const { manifest, evidence } = fixture();
+    evidence.platforms[platform].imageLayers[0] = `sha256:${'d'.repeat(64)}`;
+    assert.throws(() => verifyDerivativeImage(manifest, evidence), /base layer provenance/i);
+  }
+});
+test('rejects missing, duplicate and extra release platforms', () => {
+  for (const platforms of [{}, { 'linux/amd64': {} }, { ...fixture().evidence.platforms, 'linux/386': {} }]) {
+    const { manifest, evidence } = fixture();
+    evidence.platforms = platforms;
+    assert.throws(() => verifyDerivativeImage(manifest, evidence), /release platforms/i);
+  }
+});
+test('fails closed for duplicate or indeterminate release/tag lookups', () => {
+  for (const value of [undefined, null, ['other', 'other'], [null], 'not-an-array']) {
+    const { manifest, evidence } = fixture();
+    evidence.existingReleaseTags = value;
+    assert.throws(() => verifyDerivativeImage(manifest, evidence), /release tag lookup/i);
+  }
+});
+test('rejects an occupied image version tag', () => {
+  const { manifest, evidence } = fixture();
+  evidence.imageTagAbsent = false;
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /image tag.*absent/i);
+});
+test('requires matching platform inventory and overlay hashes', () => {
+  const { manifest, evidence } = fixture();
+  evidence.platforms['linux/arm64'].overlayHashes['routes/api.php'] = 'd'.repeat(64);
+  assert.throws(() => verifyDerivativeImage(manifest, evidence), /overlay hash/i);
+});
+
+test('GitHub lookup permits only the exact triggering lightweight tag and no releases', async () => {
+  const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
+  const responses = [
+    new Response('[]', { status: 200 }),
+    Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } }),
+    new Response('', { status: 404 }),
+  ];
+  assert.deepEqual(await checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift()), {
+    existingReleaseTags: [], imageTagAbsent: true,
+  });
+});
+test('GitHub/registry lookups reject duplicate, occupied, malformed and indeterminate responses', async () => {
+  const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
+  for (const response of [
+    Response.json([{ tag_name: 'x' }, { tag_name: 'x' }]),
+    Response.json([{ tag_name: '6.7.9-fh.1' }]),
+    Response.json({ message: 'unknown' }),
+    new Response('', { status: 403 }), new Response('', { status: 429 }), new Response('', { status: 500 }),
+  ]) {
+    await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => response));
+  }
+  for (const tagResponse of [new Response('', { status: 404 }), Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: 'd'.repeat(40) } })]) {
+    const responses = [Response.json([]), tagResponse];
+    await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift()));
+  }
+  for (const status of [200, 401, 403, 429, 500]) {
+    const responses = [Response.json([]), Response.json({ ref: 'refs/tags/6.7.9-fh.1', object: { type: 'commit', sha: commit } }), new Response('', { status })];
+    await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => responses.shift()));
+  }
+});
+
+test('rejects a changed source archive against a freshly generated Git archive', async () => {
+  const { verifySourceArchive } = await import('./verify-derivative-image.mjs');
+  const { execFileSync } = await import('node:child_process');
+  const source = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const archive = execFileSync('git', ['archive', '--format=tar', '--prefix=firefly-iii-6.7.9-fh.1/', source], { maxBuffer: 256 * 1024 * 1024 });
+  assert.match(verifySourceArchive('6.7.9-fh.1', source, archive), /^[0-9a-f]{64}$/);
+  const altered = Buffer.from(archive);
+  altered[0] ^= 1;
+  assert.throws(() => verifySourceArchive('6.7.9-fh.1', source, altered), /exact derivative commit/i);
+});
+test('checks Git ancestry against the pinned upstream commit', async () => {
+  const { verifyUpstreamAncestry, UPSTREAM_COMMIT } = await import('./verify-derivative-image.mjs');
+  assert.equal(verifyUpstreamAncestry('HEAD'), true);
+  assert.throws(() => verifyUpstreamAncestry(`${UPSTREAM_COMMIT}^`));
+});
+test('follows release pagination and detects duplicates across pages', async () => {
+  const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
+  const firstPage = Array.from({ length: 100 }, (_, i) => ({ tag_name: `old-${i}` }));
+  const pages = [Response.json(firstPage), Response.json([{ tag_name: 'old-0' }])];
+  await assert.rejects(() => checkReleaseAvailability('6.7.9-fh.1', commit, async () => pages.shift()), /duplicate release tag lookup/i);
 });
