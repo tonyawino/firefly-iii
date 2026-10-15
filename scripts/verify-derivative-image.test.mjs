@@ -141,6 +141,19 @@ test('GitHub lookup permits only the exact triggering lightweight tag and no rel
     existingReleaseTags: [], imageTagAbsent: true,
   });
 });
+test('selects unique platform-specific base child manifests for registry verification', async () => {
+  const { basePlatformDigest } = await import('./verify-derivative-image.mjs');
+  const amd64 = `sha256:${'a'.repeat(64)}`;
+  const arm64 = `sha256:${'b'.repeat(64)}`;
+  const index = { manifests: [
+    { digest: amd64, platform: { os: 'linux', architecture: 'amd64' } },
+    { digest: arm64, platform: { os: 'linux', architecture: 'arm64' } },
+  ] };
+  assert.equal(basePlatformDigest(index, 'linux/amd64'), amd64);
+  assert.equal(basePlatformDigest(index, 'linux/arm64'), arm64);
+  assert.throws(() => basePlatformDigest({ manifests: [index.manifests[0], index.manifests[0]] }, 'linux/amd64'), /exactly one/i);
+  assert.throws(() => basePlatformDigest(index, 'linux/arm/v7'), /exactly one/i);
+});
 test('GitHub/registry lookups reject duplicate, occupied, malformed and indeterminate responses', async () => {
   const { checkReleaseAvailability } = await import('./verify-derivative-image.mjs');
   for (const response of [

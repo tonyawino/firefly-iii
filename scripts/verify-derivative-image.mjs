@@ -198,6 +198,15 @@ export function compareImageInventories(baseFiles, imageFiles) {
   };
 }
 
+export function basePlatformDigest(index, platform) {
+  assert.ok(Array.isArray(index?.manifests), 'base image index manifests are required');
+  const matches = index.manifests.filter(descriptor =>
+    `${descriptor.platform?.os}/${descriptor.platform?.architecture}` === platform);
+  assert.equal(matches.length, 1, `base image index must contain exactly one ${platform} manifest`);
+  assert.match(matches[0].digest, digestPattern, `invalid ${platform} base manifest digest`);
+  return matches[0].digest;
+}
+
 function imageEvidence(base, derivative, baseFiles, imageFiles) {
   assert.deepEqual(derivative.Config.Entrypoint, base.Config.Entrypoint, 'upstream entrypoint changed');
   assert.deepEqual(derivative.Config.Cmd, base.Config.Cmd, 'upstream command changed');
@@ -218,6 +227,8 @@ export async function verifyReleaseImage(tag, archivePath, expectedDigest, outpu
   const imageIndexDigest = observed.match(/^Digest:\s+(sha256:[0-9a-f]{64})\s*$/m)?.[1];
   assert.equal(imageIndexDigest, expectedDigest, 'registry image index digest mismatch');
   const index = JSON.parse(run('docker', ['buildx', 'imagetools', 'inspect', '--raw', ref]));
+  const baseRef = `fireflyiii/core@${BASE_DIGEST}`;
+  const baseIndex = JSON.parse(run('docker', ['buildx', 'imagetools', 'inspect', '--raw', baseRef]));
   const platforms = {};
   for (const descriptor of index.manifests) {
     if (descriptor.platform?.os === 'unknown' && descriptor.platform?.architecture === 'unknown') {
@@ -226,12 +237,14 @@ export async function verifyReleaseImage(tag, archivePath, expectedDigest, outpu
     }
     const platform = `${descriptor.platform?.os}/${descriptor.platform?.architecture}`;
     assert.ok(RELEASE_PLATFORMS.includes(platform) && !platforms[platform], 'unexpected or duplicate release platforms');
-    const baseRef = `fireflyiii/core@${BASE_DIGEST}`;
+    // Pull the child digest rather than the shared index digest. Docker cannot
+    // store two platform variants under the same index digest on every runner.
+    const basePlatformRef = `fireflyiii/core@${basePlatformDigest(baseIndex, platform)}`;
     const childRef = `${IMAGE}@${descriptor.digest}`;
-    const base = inspectImage(baseRef, platform);
+    const base = inspectImage(basePlatformRef, platform);
     const derivative = inspectImage(childRef, platform);
     assert.equal(derivative.Config.Labels['org.opencontainers.image.revision'], sourceCommit, 'source commit label mismatch');
-    platforms[platform] = imageEvidence(base, derivative, inventory(baseRef, platform), inventory(childRef, platform));
+    platforms[platform] = imageEvidence(base, derivative, inventory(basePlatformRef, platform), inventory(childRef, platform));
   }
   const overlays = Object.fromEntries(OVERLAY_FILES.map(path => [path, sha256(readFileSync(path))]));
   // Compare the provided archive with a freshly generated archive of HEAD, not just a caller claim.
