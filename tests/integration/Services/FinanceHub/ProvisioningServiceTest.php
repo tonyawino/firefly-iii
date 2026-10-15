@@ -578,6 +578,67 @@ final class ProvisioningServiceTest extends TestCase
         self::assertNotNull(ProvisioningOperation::query()->sole()->encrypted_credential);
     }
 
+    #[DataProvider('inconsistentAcknowledgementRecords')]
+    public function testAcknowledgementRejectsBrokenCredentialStateWithoutChangingEscrow(string $mutation, bool $acknowledged): void
+    {
+        $this->createBootstrapSchema();
+        $result = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        if ($acknowledged) {
+            $this->service()->acknowledge(self::TENANT_ID, $result['operation_id']);
+        }
+        match ($mutation) {
+            'missing user' => User::query()->delete(),
+            'missing group' => UserGroup::query()->delete(),
+            'missing membership' => GroupMembership::query()->delete(),
+            'blocked user' => User::query()->update(['blocked' => true]),
+            'missing role' => DB::table('role_user')->delete(),
+            'missing token' => Passport::token()->newQuery()->delete(),
+            'revoked token' => Passport::token()->newQuery()->update(['revoked' => true]),
+            'revoked client' => Passport::client()->newQuery()->update(['revoked' => true]),
+            'foreign token' => Passport::token()->newQuery()->update(['user_id' => 999]),
+            'untracked user' => User::query()->create(['email' => 'untracked@invalid', 'password' => 'synthetic']),
+        };
+        $operation = ProvisioningOperation::query()->findOrFail($result['operation_id']);
+        $before = $operation->getAttributes();
+        try {
+            $this->service()->acknowledge(self::TENANT_ID, $operation->id);
+            self::fail('Broken credential state must not allow acknowledgement.');
+        } catch (DomainException $exception) {
+            self::assertSame('operation_conflict', $exception->getMessage());
+            self::assertNull($exception->getPrevious());
+        }
+        self::assertSame($before, $operation->fresh()->getAttributes());
+        self::assertSame($acknowledged ? 'acknowledged' : 'prepared', $operation->fresh()->state);
+        if (!$acknowledged) {
+            self::assertSame($result['credential'], $this->service()->decryptCredential($operation->fresh()->encrypted_credential));
+        }
+    }
+
+    public static function inconsistentAcknowledgementRecords(): iterable
+    {
+        foreach (self::inconsistentBootstrapRecords() as $mutation => $arguments) {
+            yield 'prepared '.$mutation => [$arguments[0], false];
+            yield 'acknowledged '.$mutation => [$arguments[0], true];
+        }
+    }
+
+    public function testAcknowledgementRequiresDecryptableEscrowBeforeErasingIt(): void
+    {
+        $this->createBootstrapSchema();
+        $result = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $operation = ProvisioningOperation::query()->findOrFail($result['operation_id']);
+        $this->setEncryptionKey();
+        $before = $operation->getAttributes();
+        try {
+            $this->service()->acknowledge(self::TENANT_ID, $operation->id);
+            self::fail('Unrecoverable escrow must not be erased.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('credential_unavailable', $exception->getMessage());
+        }
+        self::assertSame($before, $operation->fresh()->getAttributes());
+        self::assertSame('prepared', $operation->fresh()->state);
+    }
+
     public function testMissingGroupOwnerRoleRollsBackTheEntireBootstrap(): void
     {
         $this->createBootstrapSchema();
@@ -650,6 +711,7 @@ final class ProvisioningServiceTest extends TestCase
         self::assertSame($expected, $this->service()->confirmRotation(self::TENANT_ID, $operation->id));
         self::assertSame($expected, $this->service()->status(self::TENANT_ID, $operation->id));
         self::assertSame(['operation_id' => $bootstrap['operation_id'], 'state' => 'acknowledged'], $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+        self::assertSame(['operation_id' => $bootstrap['operation_id'], 'state' => 'acknowledged'], $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']));
     }
 
     public function testCommittedRotationsRemainRetryableAfterPassportPurgesRevokedTokens(): void
@@ -673,6 +735,7 @@ final class ProvisioningServiceTest extends TestCase
         self::assertNull(Passport::token()->newQuery()->find($oldId));
         self::assertSame(1, Passport::token()->newQuery()->count());
         self::assertSame($acknowledged, $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+        self::assertSame($acknowledged, $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']));
         self::assertSame($committed, $this->service()->status(self::TENANT_ID, $rotation['operation_id']));
         self::assertSame($committed, $this->service()->confirmRotation(self::TENANT_ID, $rotation['operation_id']));
         self::assertSame($committed, $this->service()->rotate(self::TENANT_ID, $rotationKey));

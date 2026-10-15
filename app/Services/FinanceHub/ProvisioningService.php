@@ -162,6 +162,7 @@ final class ProvisioningService
     {
         return $this->withLockedState($tenantId, function (ProvisioningState $state) use ($operationId): array {
             $operation = $this->bootstrapOperation($state, $operationId);
+            $this->activeCredentialChain($state);
             if ('prepared' === $operation->state) {
                 $this->bootstrapResult($operation);
                 $operation->fill(['state' => 'acknowledged', 'encrypted_credential' => null])->save();
