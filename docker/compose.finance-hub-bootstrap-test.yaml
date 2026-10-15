@@ -1,0 +1,98 @@
+x-firefly: &firefly
+  image: ${FH_TEST_IMAGE:-fireflyiii-tenant-bootstrap:local}
+  pull_policy: never
+  restart: "no"
+  environment: &firefly-env
+    APP_ENV: production
+    APP_DEBUG: "false"
+    DB_CONNECTION: pgsql
+    DB_PORT: "5432"
+    DB_DATABASE: synthetic_firefly
+    DB_USERNAME: synthetic_firefly
+    SITE_OWNER: synthetic@invalid
+    MAIL_MAILER: log
+    ALLOW_WEBHOOKS: "false"
+    ALLOW_EXTERNAL_MAP: "false"
+    DISABLE_FRAME_HEADER: "false"
+    ENABLE_EXTERNAL_RATES: "false"
+    SEND_ERROR_MESSAGE: "false"
+    CHECK_FOR_UPDATES: "false"
+    APP_LOG_LEVEL: emergency
+    AUDIT_LOG_LEVEL: emergency
+
+x-database: &database
+  image: postgres:17-alpine
+  restart: "no"
+  environment: &database-env
+    POSTGRES_DB: synthetic_firefly
+    POSTGRES_USER: synthetic_firefly
+  healthcheck:
+    test: [CMD-SHELL, pg_isready -U synthetic_firefly -d synthetic_firefly]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  postgres-a:
+    <<: *database
+    environment:
+      <<: *database-env
+      POSTGRES_PASSWORD: ${FH_TEST_DB_PASSWORD_A:?generated synthetic password required}
+    volumes: [postgres_a:/var/lib/postgresql/data]
+    networks: [tenant_a]
+  postgres-b:
+    <<: *database
+    environment:
+      <<: *database-env
+      POSTGRES_PASSWORD: ${FH_TEST_DB_PASSWORD_B:?generated synthetic password required}
+    volumes: [postgres_b:/var/lib/postgresql/data]
+    networks: [tenant_b]
+  firefly-a:
+    <<: *firefly
+    environment:
+      <<: *firefly-env
+      APP_URL: http://firefly-a:8080
+      APP_KEY: ${FH_TEST_APP_KEY_A:?generated synthetic key required}
+      DB_HOST: postgres-a
+      DB_PASSWORD: ${FH_TEST_DB_PASSWORD_A:?generated synthetic password required}
+      FIREFLY_TENANT_ID: ${FH_TEST_TENANT_A:?generated synthetic tenant required}
+      FIREFLY_PROVISIONING_SECRET: ${FH_TEST_SECRET_A:?generated synthetic secret required}
+    depends_on:
+      postgres-a: {condition: service_healthy}
+    volumes: [upload_a:/var/www/html/storage/upload]
+    networks: [tenant_a]
+  firefly-b:
+    <<: *firefly
+    environment:
+      <<: *firefly-env
+      APP_URL: http://firefly-b:8080
+      APP_KEY: ${FH_TEST_APP_KEY_B:?generated synthetic key required}
+      DB_HOST: postgres-b
+      DB_PASSWORD: ${FH_TEST_DB_PASSWORD_B:?generated synthetic password required}
+      FIREFLY_TENANT_ID: ${FH_TEST_TENANT_B:?generated synthetic tenant required}
+      FIREFLY_PROVISIONING_SECRET: ${FH_TEST_SECRET_B:?generated synthetic secret required}
+    depends_on:
+      postgres-b: {condition: service_healthy}
+    volumes: [upload_b:/var/www/html/storage/upload]
+    networks: [tenant_b]
+  test-client:
+    image: ${FH_TEST_IMAGE:-fireflyiii-tenant-bootstrap:local}
+    pull_policy: never
+    restart: "no"
+    entrypoint: [php]
+    profiles: [proof]
+    environment:
+      FH_TEST_TENANT_A: ${FH_TEST_TENANT_A:?generated synthetic tenant required}
+      FH_TEST_TENANT_B: ${FH_TEST_TENANT_B:?generated synthetic tenant required}
+      FH_TEST_SECRET_A: ${FH_TEST_SECRET_A:?generated synthetic secret required}
+      FH_TEST_SECRET_B: ${FH_TEST_SECRET_B:?generated synthetic secret required}
+    networks: [tenant_a, tenant_b]
+
+networks:
+  tenant_a: {internal: true}
+  tenant_b: {internal: true}
+volumes:
+  postgres_a:
+  postgres_b:
+  upload_a:
+  upload_b:
