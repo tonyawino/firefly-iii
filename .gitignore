@@ -1,4 +1,5 @@
 /node_modules
+/.worktrees/
 /storage/*.key
 /vendor
 public/hot
