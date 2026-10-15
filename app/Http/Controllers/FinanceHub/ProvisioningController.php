@@ -42,23 +42,18 @@ final class ProvisioningController extends Controller
 
     public function rotate(Request $request): JsonResponse
     {
-        return $this->rotationUnavailable($request, ['tenant_id', 'idempotency_key'], null);
+        return $this->respond(
+            $request, ['tenant_id', 'idempotency_key'], null,
+            static fn (ProvisioningService $service, array $input): array => $service->rotate($input['tenant_id'], $input['idempotency_key'])
+        );
     }
 
     public function confirmRotation(Request $request, string $operationId): JsonResponse
     {
-        return $this->rotationUnavailable($request, ['tenant_id'], $operationId);
-    }
-
-    private function rotationUnavailable(Request $request, array $fields, ?string $operationId): JsonResponse
-    {
-        // Reserve the complete authenticated contract without issuing credentials.
-        return $this->respond($request, $fields, $operationId,
-            static function (ProvisioningService $service, array $input): never {
-                $service->assertTenant($input['tenant_id']);
-
-                throw new RuntimeException('rotation_unavailable');
-            });
+        return $this->respond(
+            $request, ['tenant_id'], $operationId,
+            static fn (ProvisioningService $service, array $input): array => $service->confirmRotation($input['tenant_id'], $operationId)
+        );
     }
 
     private function respond(Request $request, array $fields, ?string $operationId, Closure $action): JsonResponse
@@ -80,13 +75,10 @@ final class ProvisioningController extends Controller
             return $this->json($action(app(ProvisioningService::class), $input));
         } catch (DomainException $exception) {
             $code = $exception->getMessage();
-            if (in_array($code, ['tenant_mismatch', 'bootstrap_conflict', 'operation_conflict'], true)) {
+            if (in_array($code, ['tenant_mismatch', 'bootstrap_conflict', 'operation_conflict', 'rotation_conflict'], true)) {
                 return $this->json(['error' => $code], 409);
             }
         } catch (RuntimeException $exception) {
-            if ('rotation_unavailable' === $exception->getMessage()) {
-                return $this->json(['error' => 'rotation_unavailable'], 503);
-            }
             if ('credential_unavailable' === $exception->getMessage()) {
                 return $this->json(['error' => 'credential_unavailable'], 409);
             }

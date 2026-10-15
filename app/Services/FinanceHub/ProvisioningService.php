@@ -20,6 +20,7 @@ use Laravel\Passport\ClientRepository;
 use Laravel\Passport\Events\AccessTokenCreated;
 use Laravel\Passport\Passport;
 use Laravel\Passport\PersonalAccessTokenResult;
+use Laravel\Passport\Token;
 use Psr\Log\NullLogger;
 use RuntimeException;
 use SensitiveParameter;
@@ -81,18 +82,18 @@ final class ProvisioningService
                 if (strtolower($operation->idempotency_key) !== $idempotencyKey) {
                     throw new DomainException('bootstrap_conflict');
                 }
-                $owner = User::query()->find($state->user_id);
-                $token = Passport::token()->newQuery()->find($operation->pat_id);
-                if (null === $owner || $owner->blocked || !$owner->hasRole('owner')
-                    || null === $owner->userGroup
-                    || !$owner->groupMemberships()->where('user_group_id', $owner->user_group_id)
-                        ->whereHas('userRole', static fn ($query) => $query->where('title', UserRoleEnum::OWNER->value))->exists()
-                    || 1 !== User::query()->count()
-                    || null === $token || $token->revoked || $token->expires_at?->isPast()
-                    || null === $token->client || $token->client->revoked || !$token->client->hasGrantType('personal_access')
-                    || (int) $token->user_id !== $owner->id
-                    || $state->active_pat_id !== $operation->pat_id) {
-                    throw new DomainException('bootstrap_conflict');
+                if ('acknowledged' === $operation->state) {
+                    try {
+                        $this->activeCredentialChain($state);
+                    } catch (DomainException) {
+                        throw new DomainException('bootstrap_conflict');
+                    }
+                } else {
+                    $owner = $this->integrationOwner($state, 'bootstrap_conflict');
+                    $this->activeToken($operation->pat_id, $owner, 'bootstrap_conflict');
+                    if ($state->active_pat_id !== $operation->pat_id) {
+                        throw new DomainException('bootstrap_conflict');
+                    }
                 }
 
                 return $this->bootstrapResult($operation);
@@ -148,7 +149,9 @@ final class ProvisioningService
     public function status(string $tenantId, string $operationId): array
     {
         return $this->withLockedState($tenantId, function (ProvisioningState $state) use ($operationId): array {
-            $operation = $this->bootstrapOperation($state, $operationId);
+            $operation = strtolower((string) $state->bootstrap_operation_id) === strtolower($operationId)
+                ? $this->bootstrapOperation($state, $operationId)
+                : $this->rotationOperation($state, $operationId);
 
             return ['operation_id' => $operation->id, 'state' => $operation->state];
         });
@@ -168,6 +171,154 @@ final class ProvisioningService
 
             return ['operation_id' => $operation->id, 'state' => $operation->state];
         });
+    }
+
+    /** @return array{operation_id: string, state: string, credential?: string} */
+    public function rotate(string $tenantId, string $idempotencyKey): array
+    {
+        if (1 !== preg_match('/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i', $idempotencyKey)) {
+            throw new DomainException('invalid_request');
+        }
+        $idempotencyKey = strtolower($idempotencyKey);
+
+        return $this->withLockedState($tenantId, function (ProvisioningState $state) use ($idempotencyKey): array {
+            $this->activeCredentialChain($state);
+            $operation = ProvisioningOperation::query()->where('kind', 'rotate')->where('idempotency_key', $idempotencyKey)->first();
+            if (null !== $operation) {
+                return $this->rotationResult($this->rotationOperation($state, $operation->id));
+            }
+            // Any unresolved rotation prevents issuing another replacement.
+            if (ProvisioningOperation::query()->where('kind', 'rotate')->where('state', '!=', 'committed')->exists()) {
+                throw new DomainException('rotation_conflict');
+            }
+            $token = $this->createIntegrationToken($this->integrationOwner($state));
+            $operation = ProvisioningOperation::query()->create([
+                'id' => (string) Str::uuid(),
+                'kind' => 'rotate',
+                'idempotency_key' => $idempotencyKey,
+                'state' => 'prepared',
+                'pat_id' => $token->accessTokenId,
+                'prior_pat_id' => $state->active_pat_id,
+                'encrypted_credential' => $this->encryptCredential($token->accessToken),
+            ]);
+
+            return ['operation_id' => $operation->id, 'state' => $operation->state, 'credential' => $token->accessToken];
+        });
+    }
+
+    /** @return array{operation_id: string, state: string} */
+    public function confirmRotation(string $tenantId, string $operationId): array
+    {
+        return $this->withLockedState($tenantId, function (ProvisioningState $state) use ($operationId): array {
+            $operation = $this->rotationOperation($state, $operationId);
+            if ('prepared' === $operation->state) {
+                // Verify replay is recoverable before irreversibly selecting it.
+                $this->rotationResult($operation);
+                $old = $this->activeToken($operation->prior_pat_id, $this->integrationOwner($state));
+                $old->revoke();
+                $state->fill(['active_pat_id' => $operation->pat_id])->save();
+                $operation->fill(['state' => 'committed', 'encrypted_credential' => null])->save();
+            }
+
+            return ['operation_id' => $operation->id, 'state' => $operation->state];
+        });
+    }
+
+    private function integrationOwner(ProvisioningState $state, string $error = 'operation_conflict'): User
+    {
+        $owner = User::query()->find($state->user_id);
+        if (null === $owner || $owner->blocked || !$owner->hasRole('owner')
+            || null === $owner->userGroup || 1 !== User::query()->count()
+            || !$owner->groupMemberships()->where('user_group_id', $owner->user_group_id)
+                ->whereHas('userRole', static fn ($query) => $query->where('title', UserRoleEnum::OWNER->value))->exists()) {
+            throw new DomainException($error);
+        }
+
+        return $owner;
+    }
+
+    private function activeToken(?string $id, User $owner, string $error = 'operation_conflict'): Token
+    {
+        $token = Passport::token()->newQuery()->whereKey($id)->lockForUpdate()->first();
+        if (null === $token || $token->revoked || $token->expires_at?->isPast()
+            || (int) $token->user_id !== $owner->id || null === $token->client
+            || $token->client->revoked || !$token->client->hasGrantType('personal_access')) {
+            throw new DomainException($error);
+        }
+
+        return $token;
+    }
+
+    /**
+     * Prove that the current credential descends from this singleton's bootstrap.
+     * Historical committed operations remain retryable after later rotations.
+     *
+     * @return list<string> Committed rotation identifiers in the active chain.
+     */
+    private function activeCredentialChain(ProvisioningState $state): array
+    {
+        $bootstrap = $this->bootstrapOperation($state, (string) $state->bootstrap_operation_id);
+        if (!in_array($bootstrap->state, ['prepared', 'acknowledged'], true)
+            || ('prepared' === $bootstrap->state) !== (null !== $bootstrap->encrypted_credential)) {
+            throw new DomainException('operation_conflict');
+        }
+        $owner = $this->integrationOwner($state);
+        $this->activeToken($state->active_pat_id, $owner);
+        $cursor = $state->active_pat_id;
+        $chain = [];
+        while ($cursor !== $bootstrap->pat_id) {
+            $matches = ProvisioningOperation::query()->where('kind', 'rotate')->where('state', 'committed')->where('pat_id', $cursor)->get();
+            if (1 !== $matches->count()) {
+                throw new DomainException('operation_conflict');
+            }
+            $operation = $matches->first();
+            if (in_array($operation->id, $chain, true) || null !== $operation->encrypted_credential || null === $operation->prior_pat_id) {
+                throw new DomainException('operation_conflict');
+            }
+            $prior = Passport::token()->newQuery()->whereKey($operation->prior_pat_id)->lockForUpdate()->first();
+            if (null === $prior || !$prior->revoked || (int) $prior->user_id !== $owner->id) {
+                throw new DomainException('operation_conflict');
+            }
+            $chain[] = $operation->id;
+            $cursor = $operation->prior_pat_id;
+        }
+
+        return $chain;
+    }
+
+    private function rotationOperation(ProvisioningState $state, string $operationId): ProvisioningOperation
+    {
+        $chain = $this->activeCredentialChain($state);
+        $operation = ProvisioningOperation::query()->find(strtolower($operationId));
+        if (null === $operation || 'rotate' !== $operation->kind || null === $operation->pat_id || null === $operation->prior_pat_id
+            || $operation->pat_id === $operation->prior_pat_id) {
+            throw new DomainException('operation_conflict');
+        }
+        if ('committed' === $operation->state && in_array($operation->id, $chain, true) && null === $operation->encrypted_credential) {
+            return $operation;
+        }
+        if ('prepared' !== $operation->state || $operation->prior_pat_id !== $state->active_pat_id
+            || 1 !== ProvisioningOperation::query()->where('kind', 'rotate')->where('state', '!=', 'committed')->count()) {
+            throw new DomainException('operation_conflict');
+        }
+        $this->activeToken($operation->pat_id, $this->integrationOwner($state));
+
+        return $operation;
+    }
+
+    /** @return array{operation_id: string, state: string, credential?: string} */
+    private function rotationResult(ProvisioningOperation $operation): array
+    {
+        $result = ['operation_id' => $operation->id, 'state' => $operation->state];
+        if ('committed' === $operation->state && null === $operation->encrypted_credential) {
+            return $result;
+        }
+        if ('prepared' !== $operation->state || null === $operation->encrypted_credential) {
+            throw new DomainException('operation_conflict');
+        }
+        $result['credential'] = $this->decryptCredential($operation->encrypted_credential);
+
+        return $result;
     }
 
     private function createIntegrationOwner(): User

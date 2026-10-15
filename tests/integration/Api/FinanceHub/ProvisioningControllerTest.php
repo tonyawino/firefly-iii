@@ -230,11 +230,14 @@ final class ProvisioningControllerTest extends TestCase
     }
 
     #[DataProvider('rotationEndpoints')]
-    public function testRotationPlaceholdersAreAuthenticatedValidatedAndHaveNoDatabaseEffects(string $path, array $payload): void
+    public function testRotationEndpointsAreAuthenticatedAndStrictlyValidated(string $path, array $payload): void
     {
         DB::connection()->enableQueryLog();
         $response = $this->postJson(self::PREFIX.$path, $payload, $this->headers());
-        $response->assertStatus(503)->assertExactJson(['error' => 'rotation_unavailable']);
+        $response->assertStatus(409)->assertExactJson(['error' => 'operation_conflict']);
+        self::assertSame(0, User::query()->count());
+        self::assertSame(0, Passport::token()->newQuery()->count());
+        DB::connection()->flushQueryLog();
         self::assertStringContainsString('no-store', $response->headers->get('Cache-Control'));
         $this->postJson(self::PREFIX.$path, $payload)->assertUnauthorized();
         $this->postJson(self::PREFIX.$path, $payload + ['email' => 'injected@invalid'], $this->headers())->assertStatus(422)->assertExactJson(['error' => 'invalid_request']);
@@ -254,7 +257,7 @@ final class ProvisioningControllerTest extends TestCase
         yield 'confirm' => ['/credentials/rotate/'.self::TENANT.'/confirm', ['tenant_id' => self::TENANT]];
     }
 
-    public function testRotationPlaceholderIdentifiersAreStrictUuids(): void
+    public function testRotationIdentifiersAreStrictUuids(): void
     {
         $this->postJson(self::PREFIX.'/credentials/rotate', ['tenant_id' => self::TENANT, 'idempotency_key' => 'bad-key'], $this->headers())->assertStatus(422);
         $this->postJson(self::PREFIX.'/credentials/rotate/not-a-uuid/confirm', ['tenant_id' => self::TENANT], $this->headers())->assertStatus(422);
@@ -289,6 +292,62 @@ final class ProvisioningControllerTest extends TestCase
     {
         yield 'role pivot' => ['role_user'];
         yield 'user creation' => ['users'];
+    }
+
+    public function testRotationCredentialsWorkBeforeAndAfterConfirmationAndOnlyOldPatIsRevoked(): void
+    {
+        DB::table('transaction_currencies')->insert(['code' => 'EUR', 'name' => 'Euro', 'symbol' => '€']);
+        $handler = new TestHandler();
+        Log::swap(new Logger('rotation-test', [$handler]));
+        $old = $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk()->json('credential');
+        $payload = $this->payload();
+        $prepared = $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertOk();
+        $new = $prepared->json('credential');
+        $operationId = $prepared->json('operation_id');
+        $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertExactJson($prepared->json());
+        $this->postJson(self::PREFIX.'/credentials/rotate', $this->payload(), $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'rotation_conflict']);
+        $this->getJson(self::PREFIX.'/operations/'.$operationId.'?tenant_id='.self::TENANT, $this->headers())
+            ->assertOk()->assertExactJson(['operation_id' => $operationId, 'state' => 'prepared']);
+        $this->postJson(self::PREFIX.'/operations/'.$operationId.'/ack', ['tenant_id' => self::TENANT], $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'operation_conflict']);
+        foreach ([$old, $new] as $credential) {
+            app('auth')->forgetGuards();
+            $this->getJson('/api/v1/about', ['Authorization' => 'Bearer '.$credential])->assertOk();
+        }
+        $expected = ['operation_id' => $operationId, 'state' => 'committed'];
+        foreach ([1, 2] as $attempt) {
+            $this->postJson(self::PREFIX.'/credentials/rotate/'.$operationId.'/confirm', ['tenant_id' => self::TENANT], $this->headers())
+                ->assertOk()->assertExactJson($expected);
+        }
+        $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertOk()->assertExactJson($expected);
+        $this->getJson(self::PREFIX.'/operations/'.$operationId.'?tenant_id='.self::TENANT, $this->headers())
+            ->assertOk()->assertExactJson($expected);
+        app('auth')->forgetGuards();
+        $this->getJson('/api/v1/about', ['Authorization' => 'Bearer '.$old])->assertUnauthorized();
+        app('auth')->forgetGuards();
+        $this->getJson('/api/v1/about', ['Authorization' => 'Bearer '.$new])->assertOk();
+        $logs = json_encode($handler->getRecords());
+        foreach ([$old, $new, self::SECRET, 'Authorization'] as $secret) {
+            self::assertStringNotContainsString($secret, $logs);
+        }
+    }
+
+    public function testRotationDecryptionAndForeignOperationsReturnSanitizedErrors(): void
+    {
+        $this->postJson(self::PREFIX.'/bootstrap', $this->payload(), $this->headers())->assertOk();
+        $payload = $this->payload();
+        $result = $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())->assertOk();
+        $operationId = $result->json('operation_id');
+        ProvisioningOperation::query()->whereKey($operationId)->update(['encrypted_credential' => 'synthetic SQL secret']);
+        $this->postJson(self::PREFIX.'/credentials/rotate', $payload, $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'credential_unavailable']);
+        $this->postJson(self::PREFIX.'/credentials/rotate/'.$operationId.'/confirm', ['tenant_id' => self::TENANT], $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'credential_unavailable']);
+        $this->postJson(self::PREFIX.'/credentials/rotate/'.Str::uuid().'/confirm', ['tenant_id' => self::TENANT], $this->headers())
+            ->assertStatus(409)->assertExactJson(['error' => 'operation_conflict']);
+        self::assertSame('prepared', ProvisioningOperation::query()->findOrFail($operationId)->state);
+        self::assertSame(2, Passport::token()->newQuery()->count());
     }
 
     private function payload(): array

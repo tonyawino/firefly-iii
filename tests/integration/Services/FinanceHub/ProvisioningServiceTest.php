@@ -19,6 +19,7 @@ use Illuminate\Database\Query\Grammars\SQLiteGrammar;
 use Illuminate\Foundation\Testing\TestCase;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Notification;
@@ -592,6 +593,164 @@ final class ProvisioningServiceTest extends TestCase
         self::assertSame(0, Passport::token()->newQuery()->count());
         self::assertSame(0, ProvisioningOperation::query()->count());
         self::assertNull(ProvisioningState::query()->findOrFail(1)->tenant_id);
+    }
+
+    public function testRotationReplaysThenConfirmsOnlyThePriorTokenAndAllowsAnotherRotation(): void
+    {
+        $this->createBootstrapSchema();
+        $bootstrapKey = (string) Str::uuid();
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey);
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
+        $oldId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
+        $extra = Event::fakeFor(static fn () => User::query()->sole()->createToken('Synthetic unrelated PAT'));
+        $key = (string) Str::uuid();
+        $prepared = $this->service()->rotate(self::TENANT_ID, $key);
+        self::assertSame('prepared', $prepared['state']);
+        self::assertNotSame($bootstrap['credential'], $prepared['credential']);
+        $operation = ProvisioningOperation::query()->findOrFail($prepared['operation_id']);
+        self::assertSame($oldId, $operation->prior_pat_id);
+        self::assertNotSame($oldId, $operation->pat_id);
+        self::assertSame($oldId, ProvisioningState::query()->findOrFail(1)->active_pat_id);
+        self::assertFalse(Passport::token()->newQuery()->findOrFail($oldId)->revoked);
+        self::assertSame($prepared['credential'], $this->service()->decryptCredential($operation->encrypted_credential));
+        self::assertNotSame($prepared['credential'], $operation->encrypted_credential);
+        self::assertSame($prepared, app(ProvisioningService::class)->rotate(self::TENANT_ID, strtoupper($key)));
+        self::assertSame(3, Passport::token()->newQuery()->count());
+        $expected = ['operation_id' => $operation->id, 'state' => 'committed'];
+        self::assertSame($expected, $this->service()->confirmRotation(self::TENANT_ID, $operation->id));
+        self::assertTrue(Passport::token()->newQuery()->findOrFail($oldId)->revoked);
+        self::assertFalse(Passport::token()->newQuery()->findOrFail($operation->pat_id)->revoked);
+        self::assertFalse(Passport::token()->newQuery()->findOrFail($extra->accessTokenId)->revoked);
+        self::assertSame($operation->pat_id, ProvisioningState::query()->findOrFail(1)->active_pat_id);
+        self::assertNull($operation->fresh()->encrypted_credential);
+        self::assertSame($expected, $this->service()->confirmRotation(self::TENANT_ID, $operation->id));
+        self::assertSame($expected, $this->service()->rotate(self::TENANT_ID, $key));
+        $next = $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->confirmRotation(self::TENANT_ID, $next['operation_id']);
+        self::assertSame($expected, $this->service()->confirmRotation(self::TENANT_ID, $operation->id));
+        self::assertSame($expected, $this->service()->status(self::TENANT_ID, $operation->id));
+        self::assertSame(['operation_id' => $bootstrap['operation_id'], 'state' => 'acknowledged'], $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+    }
+
+    public function testDistinctRotationKeyConflictsWhilePrepared(): void
+    {
+        $this->createBootstrapSchema();
+        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('rotation_conflict');
+        try {
+            $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        } finally {
+            self::assertSame(2, Passport::token()->newQuery()->count());
+            self::assertSame(2, ProvisioningOperation::query()->count());
+        }
+    }
+
+    #[DataProvider('rotationFailures')]
+    public function testUncertainRotationCannotReplayOrCommit(string $mutation, string $error): void
+    {
+        $this->createBootstrapSchema();
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $oldId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
+        $key = (string) Str::uuid();
+        $result = $this->service()->rotate(self::TENANT_ID, $key);
+        $operation = ProvisioningOperation::query()->findOrFail($result['operation_id']);
+        match ($mutation) {
+            'ciphertext' => $operation->update(['encrypted_credential' => 'corrupted']),
+            'key' => $this->setEncryptionKey(),
+            'revoked old' => Passport::token()->newQuery()->findOrFail($oldId)->revoke(),
+            'missing old' => Passport::token()->newQuery()->whereKey($oldId)->delete(),
+            'foreign old' => Passport::token()->newQuery()->whereKey($oldId)->update(['user_id' => 999]),
+            'revoked new' => Passport::token()->newQuery()->whereKey($operation->pat_id)->update(['revoked' => true]),
+            'foreign new' => Passport::token()->newQuery()->whereKey($operation->pat_id)->update(['user_id' => 999]),
+            'foreign operation' => $operation->update(['prior_pat_id' => 'foreign-token']),
+            'lost root' => ProvisioningOperation::query()->whereKey($bootstrap['operation_id'])->delete(),
+            'lost membership' => GroupMembership::query()->delete(),
+            'lost group role' => UserRole::query()->delete(),
+        };
+        foreach (['rotate', 'confirmRotation'] as $method) {
+            try {
+                $this->service()->{$method}(self::TENANT_ID, 'rotate' === $method ? $key : $operation->id);
+                self::fail('Uncertain rotation must fail closed.');
+            } catch (DomainException|RuntimeException $exception) {
+                self::assertSame($error, $exception->getMessage());
+            }
+        }
+        self::assertSame('prepared', $operation->fresh()->state);
+        self::assertNotNull($operation->fresh()->encrypted_credential);
+        self::assertSame($oldId, ProvisioningState::query()->findOrFail(1)->active_pat_id);
+        if (!in_array($mutation, ['revoked old', 'missing old'], true)) {
+            self::assertFalse(Passport::token()->newQuery()->findOrFail($oldId)->revoked);
+        }
+    }
+
+    public static function rotationFailures(): iterable
+    {
+        foreach (['ciphertext', 'key', 'revoked old', 'missing old', 'foreign old', 'revoked new', 'foreign new', 'foreign operation', 'lost root', 'lost membership', 'lost group role'] as $mutation) {
+            yield $mutation => [$mutation, in_array($mutation, ['ciphertext', 'key'], true) ? 'credential_unavailable' : 'operation_conflict'];
+        }
+    }
+
+    public function testRotationPrepareAndConfirmFailuresRollBackAllChanges(): void
+    {
+        $this->createBootstrapSchema();
+        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $oldId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
+        ProvisioningOperation::creating(static function (): never { throw new RuntimeException('synthetic_write_failure'); });
+        try {
+            $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+            self::fail('Prepare must roll back.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('synthetic_write_failure', $exception->getMessage());
+        } finally {
+            ProvisioningOperation::flushEventListeners();
+        }
+        self::assertSame(1, Passport::token()->newQuery()->count());
+        $result = $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        ProvisioningOperation::updating(static function (): never { throw new RuntimeException('synthetic_write_failure'); });
+        try {
+            $this->service()->confirmRotation(self::TENANT_ID, $result['operation_id']);
+            self::fail('Confirm must roll back revocation and active state.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('synthetic_write_failure', $exception->getMessage());
+        } finally {
+            ProvisioningOperation::flushEventListeners();
+        }
+        self::assertFalse(Passport::token()->newQuery()->findOrFail($oldId)->revoked);
+        self::assertSame($oldId, ProvisioningState::query()->findOrFail(1)->active_pat_id);
+        self::assertSame('prepared', ProvisioningOperation::query()->findOrFail($result['operation_id'])->state);
+    }
+
+    public function testRotationSuppressesNotificationsAndRestoresListenersEvenOnPassportFailure(): void
+    {
+        $this->createBootstrapSchema();
+        $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        Notification::fake();
+        Mail::fake();
+        $calls = 0;
+        app('events')->listen(AccessTokenCreated::class, static function () use (&$calls): void { ++$calls; });
+        $listeners = app('events')->getRawListeners()[AccessTokenCreated::class];
+        $result = $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        self::assertSame(0, $calls);
+        self::assertSame($listeners, app('events')->getRawListeners()[AccessTokenCreated::class]);
+        $this->service()->confirmRotation(self::TENANT_ID, $result['operation_id']);
+        $model = Passport::tokenModel();
+        $model::creating(static function (): never { throw new RuntimeException('synthetic_passport_failure'); });
+        try {
+            $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+            self::fail('Issuance must fail.');
+        } catch (RuntimeException $exception) {
+            self::assertSame('synthetic_passport_failure', $exception->getMessage());
+        } finally {
+            $model::flushEventListeners();
+        }
+        self::assertSame($listeners, app('events')->getRawListeners()[AccessTokenCreated::class]);
+        app('events')->dispatch(new AccessTokenCreated('synthetic', '0', 'synthetic'));
+        self::assertSame(1, $calls);
+        Notification::assertNothingSent();
+        Mail::assertNothingSent();
+        self::assertSame(2, Passport::token()->newQuery()->count());
     }
 
     private function assertBootstrapConflict(string $key, string $code, int $tokens = 1): void
