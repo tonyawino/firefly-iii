@@ -80,12 +80,13 @@ services:
     pull_policy: never
     restart: "no"
     entrypoint: [php]
-    profiles: [proof]
     environment:
       FH_TEST_TENANT_A: ${FH_TEST_TENANT_A:?generated synthetic tenant required}
       FH_TEST_TENANT_B: ${FH_TEST_TENANT_B:?generated synthetic tenant required}
       FH_TEST_SECRET_A: ${FH_TEST_SECRET_A:?generated synthetic secret required}
       FH_TEST_SECRET_B: ${FH_TEST_SECRET_B:?generated synthetic secret required}
+    # Only synthetic replay material is shared between the two client processes.
+    volumes: [proof_state:/var/www/html/storage/upload]
     networks: [tenant_a, tenant_b]
 
 networks:
@@ -96,3 +97,4 @@ volumes:
   postgres_b:
   upload_a:
   upload_b:
+  proof_state:
