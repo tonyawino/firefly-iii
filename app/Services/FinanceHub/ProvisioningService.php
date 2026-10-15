@@ -280,7 +280,9 @@ final class ProvisioningService
                 throw new DomainException('operation_conflict');
             }
             $prior = Passport::token()->newQuery()->whereKey($operation->prior_pat_id)->lockForUpdate()->first();
-            if (null === $prior || !$prior->revoked || (int) $prior->user_id !== $owner->id) {
+            // Passport may purge revoked PAT rows. The committed operation
+            // preserves the transition; surviving rows must still agree with it.
+            if (null !== $prior && (!$prior->revoked || (int) $prior->user_id !== $owner->id)) {
                 throw new DomainException('operation_conflict');
             }
             $chain[] = $operation->id;

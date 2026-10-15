@@ -17,6 +17,7 @@ use FireflyIII\User;
 use Illuminate\Database\QueryException;
 use Illuminate\Database\Query\Grammars\SQLiteGrammar;
 use Illuminate\Foundation\Testing\TestCase;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -649,6 +650,67 @@ final class ProvisioningServiceTest extends TestCase
         self::assertSame($expected, $this->service()->confirmRotation(self::TENANT_ID, $operation->id));
         self::assertSame($expected, $this->service()->status(self::TENANT_ID, $operation->id));
         self::assertSame(['operation_id' => $bootstrap['operation_id'], 'state' => 'acknowledged'], $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+    }
+
+    public function testCommittedRotationsRemainRetryableAfterPassportPurgesRevokedTokens(): void
+    {
+        $this->createBootstrapSchema();
+        foreach ([
+            '2016_06_01_000001_create_oauth_auth_codes_table.php',
+            '2016_06_01_000003_create_oauth_refresh_tokens_table.php',
+            '2024_06_01_000001_create_oauth_device_codes_table.php',
+        ] as $migration) {
+            (require base_path('vendor/laravel/passport/database/migrations/'.$migration))->up();
+        }
+        $bootstrapKey = (string) Str::uuid();
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey);
+        $acknowledged = $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
+        $rotationKey = (string) Str::uuid();
+        $rotation = $this->service()->rotate(self::TENANT_ID, $rotationKey);
+        $committed = $this->service()->confirmRotation(self::TENANT_ID, $rotation['operation_id']);
+        $oldId = ProvisioningOperation::query()->findOrFail($rotation['operation_id'])->prior_pat_id;
+        self::assertSame(0, Artisan::call('passport:purge', ['--revoked' => true]));
+        self::assertNull(Passport::token()->newQuery()->find($oldId));
+        self::assertSame(1, Passport::token()->newQuery()->count());
+        self::assertSame($acknowledged, $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+        self::assertSame($committed, $this->service()->status(self::TENANT_ID, $rotation['operation_id']));
+        self::assertSame($committed, $this->service()->confirmRotation(self::TENANT_ID, $rotation['operation_id']));
+        self::assertSame($committed, $this->service()->rotate(self::TENANT_ID, $rotationKey));
+        $next = $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        self::assertSame('committed', $this->service()->confirmRotation(self::TENANT_ID, $next['operation_id'])['state']);
+        $activeId = ProvisioningState::query()->findOrFail(1)->active_pat_id;
+        self::assertSame(0, Artisan::call('passport:purge', ['--revoked' => true]));
+        self::assertSame($activeId, Passport::token()->newQuery()->sole()->id);
+        self::assertSame($acknowledged, $this->service()->bootstrap(self::TENANT_ID, $bootstrapKey));
+        self::assertSame($committed, $this->service()->confirmRotation(self::TENANT_ID, $rotation['operation_id']));
+    }
+
+    #[DataProvider('inconsistentHistoricalTokens')]
+    public function testExistingHistoricalPatMustStillBeRevokedAndBelongToOwner(array $mutation): void
+    {
+        $this->createBootstrapSchema();
+        $bootstrap = $this->service()->bootstrap(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->acknowledge(self::TENANT_ID, $bootstrap['operation_id']);
+        $rotation = $this->service()->rotate(self::TENANT_ID, (string) Str::uuid());
+        $this->service()->confirmRotation(self::TENANT_ID, $rotation['operation_id']);
+        $operation = ProvisioningOperation::query()->findOrFail($rotation['operation_id']);
+        Passport::token()->newQuery()->whereKey($operation->prior_pat_id)->update($mutation);
+        foreach (['rotate', 'status', 'confirmRotation'] as $method) {
+            try {
+                $this->service()->{$method}(self::TENANT_ID, 'rotate' === $method ? (string) Str::uuid() : $operation->id);
+                self::fail('An inconsistent historical PAT must fail closed.');
+            } catch (DomainException $exception) {
+                self::assertSame('operation_conflict', $exception->getMessage());
+            }
+        }
+        self::assertSame($operation->pat_id, ProvisioningState::query()->findOrFail(1)->active_pat_id);
+        self::assertSame(2, Passport::token()->newQuery()->count());
+    }
+
+    public static function inconsistentHistoricalTokens(): iterable
+    {
+        yield 'unrevoked historical token' => [['revoked' => false]];
+        yield 'foreign historical token' => [['user_id' => 999]];
     }
 
     public function testDistinctRotationKeyConflictsWhilePrepared(): void
